@@ -516,7 +516,7 @@ namespace yolo
       void check() const
       {
         if (!_state)
-          detail::throw_future_error("promise already satisfied");
+          throw_future_error("promise already satisfied");
       }
 
       template <typename Arg>
