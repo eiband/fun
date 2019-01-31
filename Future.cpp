@@ -29,9 +29,6 @@ SOFTWARE.
 #include <variant>
 
 /*
- * TBD: First naive approach wich executes continuations inline recursively.
- *      Depending on the number of continuations this might exhaust stack space.
- *
  * TBD: Add synchronization if requested.
  */
 
@@ -145,7 +142,15 @@ namespace yolo
     template <typename T>
     inline constexpr bool is_valid_future_result_v = is_valid_future_result<T>::value;
 
-    template <typename T>
+    struct future_state_base
+    {
+    };
+
+    struct future_continuation;
+
+    using future_next_ptr = std::unique_ptr<future_continuation>;
+    using future_next = std::pair<future_next_ptr, std::shared_ptr<future_state_base>>;
+
     struct future_continuation
     {
       future_continuation() = default;
@@ -154,11 +159,17 @@ namespace yolo
       future_continuation(const future_continuation& that) = delete;
       future_continuation& operator=(const future_continuation& that) = delete;
 
-      virtual void continue_with(future_value<T>&& value) = 0;
+      [[nodiscard]] virtual future_next continue_with(future_state_base& state) = 0;
     };
 
+    void execute_future(future_next next)
+    {
+      while (next.first)
+        next = next.first->continue_with(*next.second);
+    }
+
     template <typename T>
-    struct future_state
+    struct future_state : public future_state_base
     {
       future_state() = default;
 
@@ -172,45 +183,45 @@ namespace yolo
         return (value.index() != 0);
       }
 
-      void satisfy()
+      [[nodiscard]] future_next_ptr next() noexcept
       {
         assert(ready());
 
-        if (_continuation)
-        {
-          _continuation->continue_with(std::move(value));
-          _continuation.reset();
-        }
+        return std::move(_continuation);
       }
 
-      void chain(std::unique_ptr<future_continuation<T>>&& cont)
+      [[nodiscard]] future_next_ptr chain(future_next_ptr&& cont) noexcept
       {
         assert(!_continuation);
 
         if (ready())
-          cont->continue_with(std::move(value));
-        else
-          _continuation = std::move(cont);
+          return std::move(cont);
+
+        _continuation = std::move(cont);
+
+        return nullptr;
       }
 
     private:
-      std::unique_ptr<future_continuation<T>> _continuation;
+      future_next_ptr _continuation;
     };
 
     template <typename T, typename U>
-    struct future_attach : future_continuation<T>
+    struct future_attach : future_continuation
     {
       explicit future_attach(std::shared_ptr<future_state<U>>&& dest)
-        : future_continuation<T>{}
+        : future_continuation{}
         , _dest(std::move(dest))
       {
       }
 
-      void continue_with(future_value<T>&& value) override
+      [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
-        _dest->value = std::move(value);
-        _dest->satisfy();
-        _dest.reset();
+        _dest->value = std::move(static_cast<future_state<T>&>(state).value);
+
+        future_next_ptr next = _dest->next();
+
+        return {std::move(next), std::move(_dest)};
       }
 
     private:
@@ -218,27 +229,27 @@ namespace yolo
     };
 
     template <typename T, typename U>
-    void attach_future(future_state<T>* src, std::shared_ptr<future_state<U>>&& dest)
+    [[nodiscard]] future_next attach_future(
+      std::shared_ptr<future_state<T>>&& src,
+      std::shared_ptr<future_state<U>>&& dest)
     {
       if (src)
       {
-        if (src->ready())
+        if (!src->ready())
         {
-          dest->value = std::move(src->value);
-          dest->satisfy();
-          dest.reset();
+          future_next_ptr next = src->chain(std::make_unique<future_attach<T, U>>(std::move(dest)));
+
+          return {std::move(next), std::move(src)};
         }
-        else
-        {
-          src->chain(std::make_unique<future_attach<T, U>>(std::move(dest)));
-        }
+
+        dest->value = std::move(src->value);
       }
       else
-      {
         dest->value = make_future_error("invalid future");
-        dest->satisfy();
-        dest.reset();
-      }
+
+      future_next_ptr next = dest->next();
+
+      return {std::move(next), std::move(dest)};
     }
 
     template <typename T, typename U, typename Func>
@@ -281,7 +292,7 @@ namespace yolo
     using future_then_result_t = future_unwrap_t<future_invoke_result_t<T, Func>>;
 
     template <typename T, typename Func>
-    struct future_then : future_continuation<T>
+    struct future_then : future_continuation
     {
       using result_type = future_then_result_t<T, Func>;
 
@@ -291,14 +302,16 @@ namespace yolo
 
       template <typename Arg>
       future_then(Arg&& func, std::shared_ptr<future_state<result_type>> state)
-        : future_continuation<T>{}
+        : future_continuation{}
         , _func(std::forward<Arg>(func))
         , _state(std::move(state))
       {
       }
 
-      void continue_with(future_value<T>&& value) override
+      [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
+        future_value<T>& value = static_cast<future_state<T>&>(state).value;
+
         if (value.index() == 1)
         {
           try
@@ -306,8 +319,8 @@ namespace yolo
             if constexpr (is_future_v<future_invoke_result_t<T, Func>>)
             {
               auto fut = std::invoke(std::move(_func), std::get<T>(std::move(value)));
-              attach_future(fut._state.get(), std::move(_state));
-              return;
+
+              return attach_future(std::move(fut._state), std::move(_state));
             }
             else
             {
@@ -324,8 +337,9 @@ namespace yolo
           _state->value = std::get<std::exception_ptr>(std::move(value));
         }
 
-        _state->satisfy();
-        _state.reset();
+        future_next_ptr next = _state->next();
+
+        return {std::move(next), std::move(_state)};
       }
 
     private:
@@ -355,7 +369,7 @@ namespace yolo
     using future_catch_result_t = std::common_type_t<T, future_unwrap_t<future_catch_invoke_result_t<Func>>>;
 
     template <typename T, typename Func>
-    struct future_catch : future_continuation<T>
+    struct future_catch : future_continuation
     {
       using result_type = future_catch_result_t<T, Func>;
 
@@ -369,14 +383,16 @@ namespace yolo
 
       template <typename Arg>
       future_catch(Arg&& func, std::shared_ptr<future_state<result_type>> state)
-        : future_continuation<T>{}
+        : future_continuation{}
         , _func(std::forward<Arg>(func))
         , _state(std::move(state))
       {
       }
 
-      void continue_with(future_value<T>&& value) override
+      [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
+        future_value<T>& value = static_cast<future_state<T>&>(state).value;
+
         if (value.index() == 1)
         {
           _state->value = std::move(value);
@@ -388,8 +404,8 @@ namespace yolo
             if constexpr (is_future_v<future_catch_invoke_result_t<Func>>)
             {
               auto fut = std::invoke(std::move(_func), std::get<std::exception_ptr>(std::move(value)));
-              attach_future(fut._state.get(), std::move(_state));
-              return;
+
+              return attach_future(std::move(fut._state), std::move(_state));
             }
             else
             {
@@ -403,8 +419,9 @@ namespace yolo
           }
         }
 
-        _state->satisfy();
-        _state.reset();
+        future_next_ptr next = _state->next();
+
+        return {std::move(next), std::move(_state)};
       }
 
     private:
@@ -450,8 +467,10 @@ namespace yolo
       future<result_type> fut;
       fut._state = std::make_shared<detail::future_state<result_type>>();
 
-      _state->chain(std::make_unique<continuation_type>(std::forward<Func>(func), fut._state));
-      _state.reset();
+      detail::future_next_ptr next =
+        _state->chain(std::make_unique<continuation_type>(std::forward<Func>(func), fut._state));
+
+      detail::execute_future({std::move(next), std::move(_state)});
 
       return fut;
     }
@@ -467,8 +486,10 @@ namespace yolo
       future<result_type> fut;
       fut._state = std::make_shared<detail::future_state<result_type>>();
 
-      _state->chain(std::make_unique<continuation_type>(std::forward<Func>(func), fut._state));
-      _state.reset();
+      detail::future_next_ptr next =
+        _state->chain(std::make_unique<continuation_type>(std::forward<Func>(func), fut._state));
+
+      detail::execute_future({std::move(next), std::move(_state)});
 
       return fut;
     }
@@ -507,10 +528,7 @@ namespace yolo
       ~promise_base()
       {
         if (_state)
-        {
-          _state->value = make_future_error("broken promise");
-          _state->satisfy();
-        }
+          satisfy(make_future_error("broken promise"));
       }
 
       void check() const
@@ -522,11 +540,11 @@ namespace yolo
       template <typename Arg>
       void satisfy(Arg&& arg)
       {
-        check();
-
         _state->value = std::forward<Arg>(arg);
-        _state->satisfy();
-        _state.reset();
+
+        future_next_ptr next = _state->next();
+
+        execute_future({std::move(next), std::move(_state)});
       }
     };
 
@@ -549,21 +567,25 @@ namespace yolo
 
     void set_value(const T& value)
     {
+      this->check();
       this->satisfy(value);
     }
 
     void set_value(T&& value)
     {
+      this->check();
       this->satisfy(std::move(value));
     }
 
     void set_exception(const std::exception_ptr& ex)
     {
+      this->check();
       this->satisfy(ex);
     }
 
     void set_exception(std::exception_ptr&& ex)
     {
+      this->check();
       this->satisfy(std::move(ex));
     }
   };
@@ -583,16 +605,19 @@ namespace yolo
 
     void set_value()
     {
+      this->check();
       this->satisfy(detail::future_void{});
     }
 
     void set_exception(const std::exception_ptr& ex)
     {
+      this->check();
       this->satisfy(ex);
     }
 
     void set_exception(std::exception_ptr&& ex)
     {
+      this->check();
       this->satisfy(std::move(ex));
     }
   };
