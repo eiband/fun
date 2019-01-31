@@ -930,4 +930,6 @@ int main()
 
     assert(!fut.valid() && (result == 5));
   }
+
+  return 0;
 }
