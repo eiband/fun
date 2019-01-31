@@ -29,10 +29,6 @@ SOFTWARE.
 #include <variant>
 
 /*
- * TBD: Add synchronization if requested.
- */
-
-/*
  * With or without synchronization?
  */
 #define YOLO_SINGLE_THREADED
@@ -45,7 +41,6 @@ SOFTWARE.
 
 #if !defined(YOLO_SINGLE_THREADED)
 #include <mutex>
-#error Not implemented
 #endif
 
 namespace yolo
@@ -176,25 +171,35 @@ namespace yolo
       future_state(const future_state& that) = delete;
       future_state& operator=(const future_state& that) = delete;
 
-      future_value<T> value;
-
       [[nodiscard]] bool ready() const YOLO_NOEXCEPT
       {
-        return (value.index() != 0);
+#if !defined(YOLO_SINGLE_THREADED)
+        const std::lock_guard lock(_mutex);
+#endif
+
+        return ready_impl();
       }
 
       [[nodiscard]] future_next_ptr next() noexcept
       {
-        assert(ready());
+#if !defined(YOLO_SINGLE_THREADED)
+        const std::lock_guard lock(_mutex);
+#endif
+
+        assert(ready_impl());
 
         return std::move(_continuation);
       }
 
       [[nodiscard]] future_next_ptr chain(future_next_ptr&& cont) noexcept
       {
+#if !defined(YOLO_SINGLE_THREADED)
+        const std::lock_guard lock(_mutex);
+#endif
+
         assert(!_continuation);
 
-        if (ready())
+        if (ready_impl())
           return std::move(cont);
 
         _continuation = std::move(cont);
@@ -202,8 +207,39 @@ namespace yolo
         return nullptr;
       }
 
+      template <typename Arg>
+      void set_value(Arg&& value)
+      {
+#if !defined(YOLO_SINGLE_THREADED)
+        const std::lock_guard lock(_mutex);
+#endif
+
+        _value = std::forward<Arg>(value);
+      }
+
+      template <typename Arg>
+      void set_value_unsafe(Arg&& value)
+      {
+        _value = std::forward<Arg>(value);
+      }
+
+      [[nodiscard]] future_value<T>&& move_value() noexcept
+      {
+        return std::move(_value);
+      }
+
     private:
+#if !defined(YOLO_SINGLE_THREADED)
+      mutable std::mutex _mutex;
+#endif
+
+      future_value<T> _value;
       future_next_ptr _continuation;
+
+      [[nodiscard]] bool ready_impl() const noexcept
+      {
+        return (_value.index() != 0);
+      }
     };
 
     template <typename T, typename U>
@@ -217,7 +253,7 @@ namespace yolo
 
       [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
-        _dest->value = std::move(static_cast<future_state<T>&>(state).value);
+        _dest->set_value(static_cast<future_state<T>&>(state).move_value());
 
         future_next_ptr next = _dest->next();
 
@@ -242,10 +278,10 @@ namespace yolo
           return {std::move(next), std::move(src)};
         }
 
-        dest->value = std::move(src->value);
+        dest->set_value(src->move_value());
       }
       else
-        dest->value = make_future_error("invalid future");
+        dest->set_value(make_future_error("invalid future"));
 
       future_next_ptr next = dest->next();
 
@@ -253,7 +289,7 @@ namespace yolo
     }
 
     template <typename T, typename U, typename Func>
-    void invoke_future_then(future_value<T>& dest, future_value<U>&& src, Func&& func)
+    void invoke_future_then(future_state<T>& dest, future_value<U>&& src, Func&& func)
     {
       if constexpr (std::is_void_v<T>)
       {
@@ -262,14 +298,14 @@ namespace yolo
         else
           std::invoke(std::forward<Func>(func), std::get<U>(std::move(src)));
 
-        dest = future_void{};
+        dest.set_value(future_void{});
       }
       else
       {
         if constexpr (std::is_void_v<U>)
-          dest = std::invoke(std::forward<Func>(func));
+          dest.set_value(std::invoke(std::forward<Func>(func)));
         else
-          dest = std::invoke(std::forward<Func>(func), std::get<U>(std::move(src)));
+          dest.set_value(std::invoke(std::forward<Func>(func), std::get<U>(std::move(src))));
       }
     }
 
@@ -310,7 +346,7 @@ namespace yolo
 
       [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
-        future_value<T>& value = static_cast<future_state<T>&>(state).value;
+        future_value<T>&& value = static_cast<future_state<T>&>(state).move_value();
 
         if (value.index() == 1)
         {
@@ -324,17 +360,17 @@ namespace yolo
             }
             else
             {
-              invoke_future_then<result_type, T>(_state->value, std::move(value), std::move(_func));
+              invoke_future_then<result_type, T>(*_state, std::move(value), std::move(_func));
             }
           }
           catch (...)
           {
-            _state->value = std::current_exception();
+            _state->set_value(std::current_exception());
           }
         }
         else
         {
-          _state->value = std::get<std::exception_ptr>(std::move(value));
+          _state->set_value(std::get<std::exception_ptr>(std::move(value)));
         }
 
         future_next_ptr next = _state->next();
@@ -348,17 +384,17 @@ namespace yolo
     };
 
     template <typename T, typename Func>
-    void invoke_future_catch(future_value<T>& dest, std::exception_ptr&& ex, Func&& func)
+    void invoke_future_catch(future_state<T>& dest, std::exception_ptr&& ex, Func&& func)
     {
       if constexpr (std::is_void_v<T>)
       {
         std::invoke(std::forward<Func>(func), std::move(ex));
 
-        dest = future_void{};
+        dest.set_value(future_void{});
       }
       else
       {
-        dest = std::invoke(std::forward<Func>(func), std::move(ex));
+        dest.set_value(std::invoke(std::forward<Func>(func), std::move(ex)));
       }
     }
 
@@ -391,11 +427,11 @@ namespace yolo
 
       [[nodiscard]] future_next continue_with(future_state_base& state) override
       {
-        future_value<T>& value = static_cast<future_state<T>&>(state).value;
+        future_value<T>&& value = static_cast<future_state<T>&>(state).move_value();
 
         if (value.index() == 1)
         {
-          _state->value = std::move(value);
+          _state->set_value(std::move(value));
         }
         else
         {
@@ -410,12 +446,12 @@ namespace yolo
             else
             {
               invoke_future_catch<result_type>(
-                _state->value, std::get<std::exception_ptr>(std::move(value)), std::move(_func));
+                *_state, std::get<std::exception_ptr>(std::move(value)), std::move(_func));
             }
           }
           catch (...)
           {
-            _state->value = std::current_exception();
+            _state->set_value(std::current_exception());
           }
         }
 
@@ -540,7 +576,7 @@ namespace yolo
       template <typename Arg>
       void satisfy(Arg&& arg)
       {
-        _state->value = std::forward<Arg>(arg);
+        _state->set_value(std::forward<Arg>(arg));
 
         future_next_ptr next = _state->next();
 
@@ -643,7 +679,7 @@ namespace yolo
         future<T> fut;
 
         fut._state = std::make_shared<future_state<T>>();
-        fut._state->value = std::forward<Arg>(arg);
+        fut._state->set_value_unsafe(std::forward<Arg>(arg));
 
         return fut;
       }
